@@ -1,0 +1,41 @@
+# 知乎爬虫配置文件示例
+# 使用说明：
+# 1. 复制此文件为 config.yaml
+# 2. 填入你的知乎 Cookie
+# 3. 修改搜索关键词
+# 4. 运行 python main.py
+
+# 知乎 Cookie（必填）
+# 获取方法：
+# 1. 登录知乎网页版 (https://www.zhihu.com)
+# 2. 打开浏览器开发者工具 (F12)
+# 3. 进入 Network 标签页
+# 4. 刷新页面，找到任意请求
+# 5. 在 Request Headers 中复制完整的 Cookie 值
+cookie: "your_cookie_here"
+
+# 搜索关键词列表（必填）
+keywords:
+  - "Python编程"
+  - "机器学习"
+  - "Web开发"
+
+# 爬取限制
+limits:
+  questions_per_keyword: 20      # 每个关键词最多搜索多少个问题
+  answers_per_question: null     # 每个问题最多爬多少回答，null表示全部
+  comments_per_answer: null      # 每个回答最多爬多少评论，null表示全部
+
+# 限速配置（避免被反爬）
+rate_limit:
+  requests_per_second: 1.5       # 每秒请求数，建议1-2之间
+  retry_times: 3                 # 失败重试次数
+  retry_backoff: 2               # 重试等待时间倍数
+
+# 数据库配置
+database_path: "data/zhihu.db"
+
+# 输出配置
+output:
+  directory: "data/exports"      # CSV 导出目录
+  format: "csv"                  # 输出格式
