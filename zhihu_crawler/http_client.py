@@ -87,6 +87,9 @@ class ZhihuHTTPClient:
         self.ua_pool = UserAgentPool()
         self.session = requests.Session()
 
+        # 禁用代理（避免代理连接问题）
+        self.session.trust_env = False
+
         # 设置默认超时
         self.timeout = 30
 
