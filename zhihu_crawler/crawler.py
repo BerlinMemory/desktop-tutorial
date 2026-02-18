@@ -89,6 +89,7 @@ class ZhihuCrawler:
         offset = 0
         limit = 20
         collected = 0
+        seen_question_ids = set()  # 去重：同一问题可能出现多次
 
         while collected < self.questions_per_keyword:
             print(f"  正在获取 offset={offset}")
@@ -104,18 +105,55 @@ class ZhihuCrawler:
                 break
 
             for item in items:
-                # 只处理问题类型
-                if item.get('type') != 'search_result':
+                item_type = item.get('type', '')
+
+                # 处理 search_result 类型（主要搜索结果，通常是answer）
+                if item_type == 'search_result':
+                    obj = item.get('object', {})
+                    question_info = obj.get('question', {})
+                    question_id = str(question_info.get('id', '') or obj.get('question_id', ''))
+                    
+                    # 如果 object 本身就是 question 类型
+                    if obj.get('type') == 'question':
+                        question_id = str(obj.get('id', ''))
+                        title = obj.get('title', '')
+                        answer_count = obj.get('answer_count', 0)
+                    elif question_id:
+                        # object 是 answer，从嵌套的 question 字段提取信息
+                        title = obj.get('title', '') or question_info.get('name', '')
+                        # 清理标题中的 HTML 标签（如 <em> 高亮标签）
+                        title = self.clean_html(title)
+                        answer_count = obj.get('answer_count', 0) or question_info.get('answer_count', 0)
+                    else:
+                        continue
+
+                # 处理 hot_timing 类型（热门话题卡片，内含问题列表）
+                elif item_type == 'hot_timing':
+                    content_items = item.get('object', {}).get('content_items', [])
+                    for ci in content_items:
+                        ci_obj = ci.get('object', {})
+                        if ci_obj.get('type') == 'question':
+                            question_id = str(ci_obj.get('id', ''))
+                            title = self.clean_html(ci_obj.get('title', ''))
+                            answer_count = ci_obj.get('answer_count', 0)
+                            
+                            if question_id and question_id not in seen_question_ids:
+                                seen_question_ids.add(question_id)
+                                url = f"https://www.zhihu.com/question/{question_id}"
+                                if self.db.insert_question(question_id, title, url, keyword, answer_count):
+                                    collected += 1
+                                    print(f"    ✓ 问题: {title[:50]}... (ID: {question_id})")
+                                if collected >= self.questions_per_keyword:
+                                    break
+                    continue  # hot_timing 已处理完，跳过下面的通用逻辑
+                else:
                     continue
 
-                obj = item.get('object', {})
-                if obj.get('type') != 'question':
+                if not question_id or question_id in seen_question_ids:
                     continue
-
-                question_id = str(obj.get('id', ''))
-                title = obj.get('title', '')
+                
+                seen_question_ids.add(question_id)
                 url = f"https://www.zhihu.com/question/{question_id}"
-                answer_count = obj.get('answer_count', 0)
 
                 if self.db.insert_question(question_id, title, url, keyword, answer_count):
                     collected += 1
