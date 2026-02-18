@@ -20,11 +20,11 @@ keywords:
   - "机器学习"
   - "Web开发"
 
-# 爬取限制
+# 爬取限制（0 = 不限制）
 limits:
-  questions_per_keyword: 20      # 每个关键词最多搜索多少个问题
-  answers_per_question: null     # 每个问题最多爬多少回答，null表示全部
-  comments_per_answer: null      # 每个回答最多爬多少评论，null表示全部
+  questions_per_keyword: 0       # 不限制问题数量
+  answers_per_question: 0        # 不限制回答数量
+  comments_per_answer: 0         # 不限制评论数量
 
 # 限速配置（避免被反爬）
 rate_limit:
