@@ -1,41 +1,54 @@
 # 知乎爬虫配置文件示例
 # 使用说明：
 # 1. 复制此文件为 config.yaml
-# 2. 填入你的知乎 Cookie
+# 2. 填入你的知乎 Cookie（支持单个或多个）
 # 3. 修改搜索关键词
 # 4. 运行 python main.py
 
-# 知乎 Cookie（必填）
+# ==================== Cookie 配置 ====================
 # 获取方法：
 # 1. 登录知乎网页版 (https://www.zhihu.com)
 # 2. 打开浏览器开发者工具 (F12)
 # 3. 进入 Network 标签页
 # 4. 刷新页面，找到任意请求
 # 5. 在 Request Headers 中复制完整的 Cookie 值
+
+# 方式一：单 Cookie（适合单账号爬取）
 cookie: "your_cookie_here"
 
-# 搜索关键词列表（必填）
+# 方式二：多 Cookie（适合并行爬取，优先级高于单 cookie）
+# 使用多个知乎账号的 Cookie，每个 Cookie 独立限速，降低封号风险
+# cookies:
+#   - "cookie_account_1"
+#   - "cookie_account_2"
+#   - "cookie_account_3"
+
+# ==================== 搜索关键词（必填）====================
 keywords:
   - "Python编程"
   - "机器学习"
   - "Web开发"
 
-# 爬取限制（0 = 不限制）
+# ==================== 并行配置 ====================
+parallel:
+  max_workers: 3             # 最大并行线程数（建议不超过 Cookie 数量）
+
+# ==================== 爬取限制（0 = 不限制）====================
 limits:
-  questions_per_keyword: 0       # 不限制问题数量
-  answers_per_question: 0        # 不限制回答数量
-  comments_per_answer: 0         # 不限制评论数量
+  questions_per_keyword: 0   # 不限制问题数量
+  answers_per_question: 0    # 不限制回答数量
+  comments_per_answer: 0     # 不限制评论数量
 
-# 限速配置（避免被反爬）
+# ==================== 限速配置（避免被反爬）====================
 rate_limit:
-  requests_per_second: 1.5       # 每秒请求数，建议1-2之间
-  retry_times: 3                 # 失败重试次数
-  retry_backoff: 2               # 重试等待时间倍数
+  requests_per_second: 1.5   # 每秒请求数，建议1-2之间（每个 Cookie 独立限速）
+  retry_times: 3             # 失败重试次数
+  retry_backoff: 2           # 重试等待时间倍数
 
-# 数据库配置
+# ==================== 数据库配置 ====================
 database_path: "data/zhihu.db"
 
-# 输出配置
+# ==================== 输出配置 ====================
 output:
-  directory: "data/exports"      # CSV 导出目录
-  format: "csv"                  # 输出格式
+  directory: "data/exports"  # CSV 导出目录
+  format: "csv"              # 输出格式
