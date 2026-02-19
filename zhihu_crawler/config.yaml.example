@@ -35,7 +35,7 @@ parallel:
 
 # ==================== 爬取限制（0 = 不限制）====================
 limits:
-  questions_per_keyword: 0   # 不限制问题数量
+  questions_per_keyword: 500   # 每个关键词最多爬取的问题数（API上限约100）
   answers_per_question: 0    # 不限制回答数量
   comments_per_answer: 0     # 不限制评论数量
 

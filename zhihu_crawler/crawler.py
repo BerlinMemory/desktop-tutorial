@@ -479,9 +479,9 @@ class ZhihuCrawler:
                 self._crawl_answers_for_question(worker, question_id)
                 self.db.update_question_status(question_id, 'done')
                 processed += 1
-                self._safe_print(f"  {worker.tag} ✓ 问题处理完成")
+                self._safe_print(f"  {worker.tag} [OK] 问题处理完成")
             except Exception as e:
-                self._safe_print(f"  {worker.tag} ✗ 问题处理失败: {e}")
+                self._safe_print(f"  {worker.tag} [FAIL] 问题处理失败: {e}")
                 self.db.update_question_status(question_id, 'failed')
 
         self._safe_print(f"  {worker.tag} 共处理 {processed} 个问题")
@@ -526,7 +526,7 @@ class ZhihuCrawler:
                 ):
                     collected += 1
                     self._safe_print(
-                        f"    {worker.tag} ✓ 回答 by {author_name} "
+                        f"    {worker.tag} [OK] 回答 by {author_name} "
                         f"(赞:{voteup_count}, 评论:{comment_count})"
                     )
 
@@ -592,9 +592,9 @@ class ZhihuCrawler:
                 self._crawl_comments_for_answer(worker, answer_id)
                 self.db.update_answer_status(answer_id, 'done')
                 processed += 1
-                self._safe_print(f"  {worker.tag} ✓ 回答处理完成")
+                self._safe_print(f"  {worker.tag} [OK] 回答处理完成")
             except Exception as e:
-                self._safe_print(f"  {worker.tag} ✗ 回答处理失败: {e}")
+                self._safe_print(f"  {worker.tag} [FAIL] 回答处理失败: {e}")
                 self.db.update_answer_status(answer_id, 'failed')
 
         self._safe_print(f"  {worker.tag} 共处理 {processed} 条回答")
@@ -634,7 +634,7 @@ class ZhihuCrawler:
                 ):
                     root_collected += 1
                     self._safe_print(
-                        f"    {worker.tag} ✓ 主评论 by {author_name} "
+                        f"    {worker.tag} [OK] 主评论 by {author_name} "
                         f"(赞:{like_count}, 子评论:{child_count})"
                     )
 
@@ -684,7 +684,7 @@ class ZhihuCrawler:
                 ):
                     collected += 1
                     self._safe_print(
-                        f"      {worker.tag} ✓ 子评论 by {author_name} -> {reply_to}"
+                        f"      {worker.tag} [OK] 子评论 by {author_name} -> {reply_to}"
                     )
 
             paging = data.get('paging', {})
