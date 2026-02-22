@@ -101,7 +101,6 @@ class ZhihuHTTPClient:
             'Referer': 'https://www.zhihu.com/',
             'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'zh-CN,zh;q=0.9,en;q=0.8',
-            'Accept-Encoding': 'gzip, deflate, br',
             'Connection': 'keep-alive',
         }
 
@@ -154,7 +153,18 @@ class ZhihuHTTPClient:
 
             # 检查响应状态
             if response.status_code == 200:
-                return response.json()
+                try:
+                    return response.json()
+                except Exception as e:
+                    # 如果 json() 失败，尝试手动解码（处理 gzip 等压缩）
+                    import json
+                    import gzip
+                    try:
+                        decompressed = gzip.decompress(response.content)
+                        return json.loads(decompressed.decode('utf-8'))
+                    except Exception:
+                        print(f"JSON解析失败: {url}, 原始错误: {e}")
+                        return None
             else:
                 print(f"请求失败(状态码 {response.status_code}): {url}")
                 return None
@@ -212,6 +222,7 @@ class ZhihuAPI:
         """
         url = f"https://www.zhihu.com/api/v4/questions/{question_id}/answers"
         params = {
+            'include': 'data[*].content,voteup_count,comment_count,excerpt,updated_time',
             'offset': offset,
             'limit': limit,
             'sort_by': sort_by

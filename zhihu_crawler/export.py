@@ -50,7 +50,7 @@ class DataExporter:
             writer.writeheader()
             writer.writerows(questions)
 
-        print(f"✓ 问题数据已导出: {filepath} ({len(questions)} 条)")
+        print(f"[OK] 问题数据已导出: {filepath} ({len(questions)} 条)")
         return filepath
 
     def export_answers(self, filename: str = None) -> str:
@@ -81,7 +81,7 @@ class DataExporter:
             writer.writeheader()
             writer.writerows(answers)
 
-        print(f"✓ 回答数据已导出: {filepath} ({len(answers)} 条)")
+        print(f"[OK] 回答数据已导出: {filepath} ({len(answers)} 条)")
         return filepath
 
     def export_comments(self, filename: str = None) -> str:
@@ -115,7 +115,7 @@ class DataExporter:
             writer.writeheader()
             writer.writerows(comments)
 
-        print(f"✓ 评论数据已导出: {filepath} ({len(comments)} 条)")
+        print(f"[OK] 评论数据已导出: {filepath} ({len(comments)} 条)")
         return filepath
 
     def export_full_data(self, filename: str = None) -> str:
@@ -148,7 +148,7 @@ class DataExporter:
             writer.writeheader()
             writer.writerows(data)
 
-        print(f"✓ 完整数据已导出: {filepath} ({len(data)} 条记录)")
+        print(f"[OK] 完整数据已导出: {filepath} ({len(data)} 条记录)")
         return filepath
 
     def export_all(self):

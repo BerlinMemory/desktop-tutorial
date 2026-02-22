@@ -3,6 +3,7 @@
 封装 SQLite 数据库的所有操作
 """
 import sqlite3
+import threading
 from datetime import datetime
 from typing import List, Dict, Optional, Tuple
 import os
@@ -16,8 +17,10 @@ class Database:
         self.db_path = db_path
         # 确保数据目录存在
         os.makedirs(os.path.dirname(db_path), exist_ok=True)
-        self.conn = sqlite3.connect(db_path)
+        # check_same_thread=False 允许多线程访问同一连接
+        self.conn = sqlite3.connect(db_path, check_same_thread=False)
         self.conn.row_factory = sqlite3.Row  # 返回字典格式
+        self._lock = threading.Lock()  # 线程锁，保护写操作
         self.init_tables()
 
     def init_tables(self):
@@ -91,20 +94,21 @@ class Database:
 
     def insert_question(self, question_id: str, title: str, url: str,
                        keyword: str, answer_count: int = 0) -> bool:
-        """插入问题，如果已存在则忽略"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-            INSERT OR IGNORE INTO questions
-            (id, title, url, keyword, answer_count, status, created_at)
-            VALUES (?, ?, ?, ?, ?, 'pending', ?)
-            """, (question_id, title, url, keyword, answer_count,
-                  datetime.now().isoformat()))
-            self.conn.commit()
-            return cursor.rowcount > 0
-        except Exception as e:
-            print(f"插入问题失败: {e}")
-            return False
+        """插入问题，如果已存在则忽略（线程安全）"""
+        with self._lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                INSERT OR IGNORE INTO questions
+                (id, title, url, keyword, answer_count, status, created_at)
+                VALUES (?, ?, ?, ?, ?, 'pending', ?)
+                """, (question_id, title, url, keyword, answer_count,
+                      datetime.now().isoformat()))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                print(f"插入问题失败: {e}")
+                return False
 
     def get_pending_questions(self, limit: Optional[int] = None) -> List[Dict]:
         """获取待处理的问题列表"""
@@ -116,12 +120,34 @@ class Database:
         return [dict(row) for row in cursor.fetchall()]
 
     def update_question_status(self, question_id: str, status: str):
-        """更新问题状态"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-        UPDATE questions SET status = ? WHERE id = ?
-        """, (status, question_id))
-        self.conn.commit()
+        """更新问题状态（线程安全）"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+            UPDATE questions SET status = ? WHERE id = ?
+            """, (status, question_id))
+            self.conn.commit()
+
+    def claim_pending_question(self) -> Optional[Dict]:
+        """
+        原子性地领取一个待处理问题（线程安全）
+        将状态从 'pending' 改为 'processing'，返回该问题
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+            SELECT * FROM questions WHERE status = 'pending'
+            ORDER BY created_at LIMIT 1
+            """)
+            row = cursor.fetchone()
+            if row:
+                question = dict(row)
+                cursor.execute("""
+                UPDATE questions SET status = 'processing' WHERE id = ?
+                """, (question['id'],))
+                self.conn.commit()
+                return question
+            return None
 
     def get_question_stats(self) -> Dict:
         """获取问题统计信息"""
@@ -143,21 +169,22 @@ class Database:
                      author_name: str, author_id: str, content: str,
                      voteup_count: int, comment_count: int,
                      created_time: str) -> bool:
-        """插入回答，如果已存在则忽略"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-            INSERT OR IGNORE INTO answers
-            (id, question_id, author_name, author_id, content,
-             voteup_count, comment_count, created_time, status)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
-            """, (answer_id, question_id, author_name, author_id, content,
-                  voteup_count, comment_count, created_time))
-            self.conn.commit()
-            return cursor.rowcount > 0
-        except Exception as e:
-            print(f"插入回答失败: {e}")
-            return False
+        """插入回答，如果已存在则忽略（线程安全）"""
+        with self._lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                INSERT OR IGNORE INTO answers
+                (id, question_id, author_name, author_id, content,
+                 voteup_count, comment_count, created_time, status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending')
+                """, (answer_id, question_id, author_name, author_id, content,
+                      voteup_count, comment_count, created_time))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                print(f"插入回答失败: {e}")
+                return False
 
     def get_pending_answers(self, limit: Optional[int] = None) -> List[Dict]:
         """获取待处理的回答列表"""
@@ -169,12 +196,34 @@ class Database:
         return [dict(row) for row in cursor.fetchall()]
 
     def update_answer_status(self, answer_id: str, status: str):
-        """更新回答状态"""
-        cursor = self.conn.cursor()
-        cursor.execute("""
-        UPDATE answers SET status = ? WHERE id = ?
-        """, (status, answer_id))
-        self.conn.commit()
+        """更新回答状态（线程安全）"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+            UPDATE answers SET status = ? WHERE id = ?
+            """, (status, answer_id))
+            self.conn.commit()
+
+    def claim_pending_answer(self) -> Optional[Dict]:
+        """
+        原子性地领取一个待处理回答（线程安全）
+        将状态从 'pending' 改为 'processing'，返回该回答
+        """
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("""
+            SELECT * FROM answers WHERE status = 'pending'
+            LIMIT 1
+            """)
+            row = cursor.fetchone()
+            if row:
+                answer = dict(row)
+                cursor.execute("""
+                UPDATE answers SET status = 'processing' WHERE id = ?
+                """, (answer['id'],))
+                self.conn.commit()
+                return answer
+            return None
 
     def get_answer_stats(self) -> Dict:
         """获取回答统计信息"""
@@ -196,21 +245,22 @@ class Database:
                       parent_id: Optional[str], is_child: int,
                       author_name: str, content: str, like_count: int,
                       reply_to: Optional[str], created_time: str) -> bool:
-        """插入评论，如果已存在则忽略"""
-        try:
-            cursor = self.conn.cursor()
-            cursor.execute("""
-            INSERT OR IGNORE INTO comments
-            (id, answer_id, parent_id, is_child, author_name,
-             content, like_count, reply_to, created_time)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (comment_id, answer_id, parent_id, is_child, author_name,
-                  content, like_count, reply_to, created_time))
-            self.conn.commit()
-            return cursor.rowcount > 0
-        except Exception as e:
-            print(f"插入评论失败: {e}")
-            return False
+        """插入评论，如果已存在则忽略（线程安全）"""
+        with self._lock:
+            try:
+                cursor = self.conn.cursor()
+                cursor.execute("""
+                INSERT OR IGNORE INTO comments
+                (id, answer_id, parent_id, is_child, author_name,
+                 content, like_count, reply_to, created_time)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (comment_id, answer_id, parent_id, is_child, author_name,
+                      content, like_count, reply_to, created_time))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                print(f"插入评论失败: {e}")
+                return False
 
     def get_comment_stats(self) -> Dict:
         """获取评论统计信息"""
@@ -258,12 +308,13 @@ class Database:
     # ==================== 工具方法 ====================
 
     def reset_failed_to_pending(self):
-        """重置失败状态为待处理（用于重试）"""
-        cursor = self.conn.cursor()
-        cursor.execute("UPDATE questions SET status = 'pending' WHERE status = 'failed'")
-        cursor.execute("UPDATE answers SET status = 'pending' WHERE status = 'failed'")
-        self.conn.commit()
-        print("已将所有失败项重置为待处理状态")
+        """重置失败状态为待处理（用于重试，线程安全）"""
+        with self._lock:
+            cursor = self.conn.cursor()
+            cursor.execute("UPDATE questions SET status = 'pending' WHERE status = 'failed'")
+            cursor.execute("UPDATE answers SET status = 'pending' WHERE status = 'failed'")
+            self.conn.commit()
+            print("已将所有失败项重置为待处理状态")
 
     def get_overall_stats(self) -> Dict:
         """获取整体统计信息"""

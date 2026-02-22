@@ -37,10 +37,16 @@ def validate_config(config: dict) -> bool:
     :param config: 配置字典
     :return: 验证是否通过
     """
-    # 检查必需字段
-    if not config.get('cookie'):
+    # 检查 Cookie（支持单个或多个）
+    cookies = config.get('cookies', [])
+    single_cookie = config.get('cookie', '')
+    has_cookies = cookies and any(c and c != 'your_cookie_here' for c in cookies)
+    has_single = single_cookie and single_cookie != 'your_cookie_here'
+
+    if not has_cookies and not has_single:
         print("错误：配置文件中未设置 Cookie")
         print("请在配置文件中填入知乎登录后的 Cookie")
+        print("支持单个 cookie 或多个 cookies 列表")
         return False
 
     if not config.get('keywords'):
@@ -93,6 +99,7 @@ def main():
         epilog="""
 使用示例:
   python main.py                    # 运行完整爬取流程
+  python main.py --preview          # 预览搜索结果（只看数量，不爬取）
   python main.py --retry-failed     # 重试失败项
   python main.py --stats            # 查看统计信息
   python main.py --export           # 导出数据到 CSV
@@ -108,6 +115,8 @@ def main():
                        help='仅显示统计信息')
     parser.add_argument('--export', action='store_true',
                        help='导出数据到 CSV')
+    parser.add_argument('--preview', action='store_true',
+                       help='预览模式：只搜索并显示问题/回答数量，不爬取内容')
     parser.add_argument('--search-only', action='store_true',
                        help='仅执行搜索阶段')
     parser.add_argument('--answers-only', action='store_true',
@@ -160,7 +169,12 @@ def main():
 
     try:
         # 根据参数选择执行模式
-        if args.search_only:
+        if args.preview:
+            print("\n运行模式: 预览搜索结果")
+            keywords = config.get('keywords', [])
+            crawler.preview_search(keywords)
+
+        elif args.search_only:
             print("\n运行模式: 仅搜索")
             keywords = config.get('keywords', [])
             crawler.crawl_search(keywords)
@@ -176,6 +190,12 @@ def main():
         else:
             # 完整流程
             print("\n运行模式: 完整爬取")
+            # 显示 Cookie 信息
+            cookie_count = len(crawler.cookies)
+            if cookie_count > 1:
+                print(f"Cookie 数量: {cookie_count}（并行模式）")
+            else:
+                print(f"Cookie 数量: 1（单线程模式）")
             crawler.run_full_crawl()
 
         # 显示统计信息
