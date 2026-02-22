@@ -308,13 +308,16 @@ class Database:
     # ==================== 工具方法 ====================
 
     def reset_failed_to_pending(self):
-        """重置失败状态为待处理（用于重试，线程安全）"""
+        """重置失败和中断的任务为待处理（用于断点续爬，线程安全）"""
         with self._lock:
             cursor = self.conn.cursor()
-            cursor.execute("UPDATE questions SET status = 'pending' WHERE status = 'failed'")
-            cursor.execute("UPDATE answers SET status = 'pending' WHERE status = 'failed'")
+            cursor.execute("UPDATE questions SET status = 'pending' WHERE status IN ('failed', 'processing')")
+            q_reset = cursor.rowcount
+            cursor.execute("UPDATE answers SET status = 'pending' WHERE status IN ('failed', 'processing')")
+            a_reset = cursor.rowcount
             self.conn.commit()
-            print("已将所有失败项重置为待处理状态")
+            if q_reset > 0 or a_reset > 0:
+                print(f"已重置中断/失败的任务: {q_reset} 个问题, {a_reset} 个回答")
 
     def get_overall_stats(self) -> Dict:
         """获取整体统计信息"""

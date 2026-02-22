@@ -600,82 +600,57 @@ class ZhihuCrawler:
         self._safe_print(f"  {worker.tag} 共处理 {processed} 条回答")
 
     def _crawl_comments_for_answer(self, worker: CrawlWorker, answer_id: str):
-        """
-        爬取指定回答的所有评论（含子评论）
-        知乎 API 存在 offset 上限（约200-300条），用双排序策略扩大覆盖：
-        第一轮 order=normal（按时间），第二轮 order=score（按热度），合并去重
-        """
-        total_collected = 0
-        for order in ['normal', 'score']:
-            round_new = self._crawl_comments_one_pass(worker, answer_id, order, total_collected)
-            total_collected += round_new
-            self._safe_print(
-                f"  {worker.tag} [{order}] 本轮新增 {round_new} 条，累计 {total_collected} 条"
-            )
-
-        self._safe_print(f"  {worker.tag} 共收集 {total_collected} 条主评论（双排序合并）")
-
-    def _crawl_comments_one_pass(self, worker: CrawlWorker, answer_id: str,
-                                  order: str, already_collected: int) -> int:
-        """
-        用指定排序爬取一轮主评论
-        :param worker: 工作器（含 Cookie 和 API 实例）
-        :param order: 排序方式 normal=时间顺序 / score=热度排序
-        :param already_collected: 之前已收集数量（用于判断上限）
-        :return: 本轮新增条数
-        """
+        """爬取指定回答的所有评论（含子评论）"""
         offset = 0
         limit = 20
-        new_count = 0
+        root_collected = 0
 
-        while True:
-            if self.comments_per_answer:
-                if already_collected + new_count >= self.comments_per_answer:
+        try:
+            while True:
+                if self.comments_per_answer and root_collected >= self.comments_per_answer:
                     self._safe_print(f"  {worker.tag} 达到评论数限制 ({self.comments_per_answer})")
                     break
 
-            data = worker.api.get_answer_root_comments(
-                answer_id, offset=offset, limit=limit, order=order
-            )
+                data = worker.api.get_answer_root_comments(answer_id, offset=offset, limit=limit)
 
-            if not data or 'data' not in data:
-                break
+                if data is None: # Request failed
+                    raise Exception("API请求失败(RootComments)")
 
-            comments = data['data']
-            if not comments:
-                break
+                if 'data' not in data:
+                    break
 
-            for comment in comments:
-                comment_id = str(comment.get('id', ''))
-                author = comment.get('author', {})
-                author_name = author.get('member', {}).get('name', '匿名用户')
-                content = comment.get('content', '')
-                like_count = comment.get('like_count', 0)
-                created_time = self.format_timestamp(comment.get('created_time', 0))
-                child_count = comment.get('child_comment_count', 0)
+                comments = data['data']
+                if not comments:
+                    break
 
-                # INSERT OR IGNORE 自动去重，is_new=True 表示是新记录
-                is_new = self.db.insert_comment(
-                    comment_id, answer_id, None, 0,
-                    author_name, content, like_count, None, created_time
-                )
-                if is_new:
-                    new_count += 1
-                    self._safe_print(
-                        f"    {worker.tag} [OK] 主评论 by {author_name} "
-                        f"(赞:{like_count}, 子评论:{child_count})"
-                    )
-                    # 只对新评论爬取子评论，避免重复
+                for comment in comments:
+                    comment_id = str(comment.get('id', ''))
+                    author = comment.get('author', {})
+                    author_name = author.get('member', {}).get('name', '匿名用户')
+                    content = comment.get('content', '')
+                    like_count = comment.get('like_count', 0)
+                    created_time = self.format_timestamp(comment.get('created_time', 0))
+                    child_count = comment.get('child_comment_count', 0)
+
+                    if self.db.insert_comment(
+                        comment_id, answer_id, None, 0,
+                        author_name, content, like_count, None, created_time
+                    ):
+                        root_collected += 1
+
                     if child_count > 0:
                         self._crawl_child_comments(worker, answer_id, comment_id, child_count)
 
-            paging = data.get('paging', {})
-            if not paging.get('is_end', True):
-                offset += limit
-            else:
-                break
+                paging = data.get('paging', {})
+                if not paging.get('is_end', True):
+                    offset += limit
+                else:
+                    break
 
-        return new_count
+            self._safe_print(f"  {worker.tag} 共收集 {root_collected} 条主评论")
+        except Exception as e:
+            self._safe_print(f"  {worker.tag} 抓取评论异常 ID {answer_id}: {e}")
+            raise e
 
     def _crawl_child_comments(self, worker: CrawlWorker, answer_id: str,
                               parent_comment_id: str, child_count: int):
@@ -684,42 +659,49 @@ class ZhihuCrawler:
         limit = 20
         collected = 0
 
-        while collected < child_count:
-            data = worker.api.get_comment_child_comments(
-                parent_comment_id, offset=offset, limit=limit
-            )
+        try:
+            while collected < child_count:
+                data = worker.api.get_comment_child_comments(
+                    parent_comment_id, offset=offset, limit=limit
+                )
 
-            if not data or 'data' not in data:
-                break
+                if data is None:
+                    raise Exception("API请求失败(ChildComments)")
 
-            child_comments = data['data']
-            if not child_comments:
-                break
+                if 'data' not in data:
+                    break
 
-            for child in child_comments:
-                child_id = str(child.get('id', ''))
-                author = child.get('author', {})
-                author_name = author.get('member', {}).get('name', '匿名用户')
-                content = child.get('content', '')
-                like_count = child.get('like_count', 0)
-                reply_to_author = child.get('reply_to_author', {})
-                reply_to = reply_to_author.get('member', {}).get('name', '')
-                created_time = self.format_timestamp(child.get('created_time', 0))
+                child_comments = data['data']
+                if not child_comments:
+                    break
 
-                if self.db.insert_comment(
-                    child_id, answer_id, parent_comment_id, 1,
-                    author_name, content, like_count, reply_to, created_time
-                ):
-                    collected += 1
-                    self._safe_print(
-                        f"      {worker.tag} [OK] 子评论 by {author_name} -> {reply_to}"
-                    )
+                for child in child_comments:
+                    child_id = str(child.get('id', ''))
+                    author = child.get('author', {})
+                    author_name = author.get('member', {}).get('name', '匿名用户')
+                    content = child.get('content', '')
+                    like_count = child.get('like_count', 0)
+                    reply_to_author = child.get('reply_to_author', {})
+                    reply_to = reply_to_author.get('member', {}).get('name', '')
+                    created_time = self.format_timestamp(child.get('created_time', 0))
 
-            paging = data.get('paging', {})
-            if not paging.get('is_end', True):
-                offset += limit
-            else:
-                break
+                    if self.db.insert_comment(
+                        child_id, answer_id, parent_comment_id, 1,
+                        author_name, content, like_count, reply_to, created_time
+                    ):
+                        collected += 1
+                        # self._safe_print(
+                        #     f"      {worker.tag} [OK] 子评论 by {author_name} -> {reply_to}"
+                        # )
+
+                paging = data.get('paging', {})
+                if not paging.get('is_end', True):
+                    offset += limit
+                else:
+                    break
+        except Exception as e:
+            self._safe_print(f"  {worker.tag} 抓取子评论异常 Parent {parent_comment_id}: {e}")
+            raise e
 
     # ==================== 完整爬取流程 ====================
 
@@ -734,6 +716,9 @@ class ZhihuCrawler:
         if not keywords:
             print("错误：未配置搜索关键词")
             return
+
+        # 断点续爬：重置上次中断/失败的任务
+        self.db.reset_failed_to_pending()
 
         print(f"配置的关键词: {keywords}")
         print(f"Cookie 数量: {len(self.cookies)}")
