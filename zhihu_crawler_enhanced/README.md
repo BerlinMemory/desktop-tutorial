@@ -325,19 +325,30 @@ python audit_db.py
 
 ### 5. 数据分布报告
 
-生成 Markdown 格式的数据分布报告（Top 15 问题）：
+生成数据分布报告（Top 15 问题）：
 
 ```bash
+# 控制台输出（ASCII安全，兼容Windows GBK控制台）
 python gen_report.py
+
+# 导出为CSV文件（完整中文支持，可用Excel打开）
+python gen_report.py --csv
 ```
 
-输出示例：
-```markdown
-| Question Title | Answers (Act/Theory) | Theory Comments | Actual Collected | Coverage |
-| :--- | :--- | :--- | :--- | :--- |
-| How to learn Python... | 45/50 | 2,340 | 1,987 | 84.9% |
-| Best programming practices... | 32/35 | 1,823 | 1,654 | 90.7% |
+**CSV输出示例**（用Excel打开）：
 ```
+问题标题,实际回答数,理论回答数,理论评论数,实际评论数,覆盖率(%)
+如何看待穷养和富养的教育方式？,45,50,2340,1987,84.9
+最好的编程实践是什么？,32,35,1823,1654,90.7
+...
+
+总计 (Top 15),,,15230,12845,84.3
+```
+
+**推荐使用 `--csv` 选项**：
+- ✅ 完整保留中文问题标题
+- ✅ Excel/WPS 可直接打开（UTF-8 with BOM）
+- ✅ 包含汇总行，便于分析
 
 ### 6. Top 15 问题统计
 
