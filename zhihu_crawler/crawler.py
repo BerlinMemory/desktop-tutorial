@@ -241,20 +241,43 @@ class ZhihuCrawler:
     def _crawl_comments_for_answer(self, answer_id: str):
         """
         爬取指定回答的所有评论（含子评论）
-        :param answer_id: 回答 ID
+        知乎 API 存在 offset 上限（约200-300条），用双排序策略扩大覆盖：
+        第一轮 order=normal（按时间），第二轮 order=score（按热度），合并去重
+        """
+        total_collected = 0
+        # 两种排序各爬一轮，INSERT OR IGNORE 自动去重
+        for order in ['normal', 'score']:
+            round_collected = self._crawl_comments_one_pass(
+                answer_id, order, total_collected
+            )
+            total_collected += round_collected
+            print(f"  [{order}] 本轮新增 {round_collected} 条，累计 {total_collected} 条")
+
+        print(f"  共收集 {total_collected} 条主评论（双排序合并）")
+
+    def _crawl_comments_one_pass(self, answer_id: str, order: str,
+                                  already_collected: int) -> int:
+        """
+        用指定排序爬取一轮主评论
+        :param order: 排序方式 normal=时间顺序 / score=热度排序
+        :param already_collected: 之前已收集数量（用于判断限制）
+        :return: 本轮新增条数
         """
         offset = 0
         limit = 20
-        root_collected = 0
+        new_count = 0
 
         while True:
-            # 检查是否达到限制
-            if self.comments_per_answer and root_collected >= self.comments_per_answer:
-                print(f"  达到评论数限制 ({self.comments_per_answer})")
-                break
+            # 检查是否达到用户设定的上限
+            if self.comments_per_answer:
+                if already_collected + new_count >= self.comments_per_answer:
+                    print(f"  达到评论数限制 ({self.comments_per_answer})")
+                    break
 
-            print(f"  获取主评论 offset={offset}")
-            data = self.api.get_answer_root_comments(answer_id, offset=offset, limit=limit)
+            print(f"  获取主评论 order={order} offset={offset}")
+            data = self.api.get_answer_root_comments(
+                answer_id, offset=offset, limit=limit, order=order
+            )
 
             if not data or 'data' not in data:
                 print(f"  获取评论失败")
@@ -274,17 +297,18 @@ class ZhihuCrawler:
                 created_time = self.format_timestamp(comment.get('created_time', 0))
                 child_count = comment.get('child_comment_count', 0)
 
-                # 插入主评论
-                if self.db.insert_comment(
+                # INSERT OR IGNORE 自动去重，返回 True 表示是新记录
+                is_new = self.db.insert_comment(
                     comment_id, answer_id, None, 0,
                     author_name, content, like_count, None, created_time
-                ):
-                    root_collected += 1
+                )
+                if is_new:
+                    new_count += 1
                     print(f"    ✓ 主评论 by {author_name} (赞:{like_count}, 子评论:{child_count})")
 
-                # 爬取子评论（楼中楼）
-                if child_count > 0:
-                    self._crawl_child_comments(answer_id, comment_id, child_count)
+                    # 只对新评论爬取子评论，避免重复
+                    if child_count > 0:
+                        self._crawl_child_comments(answer_id, comment_id, child_count)
 
             # 检查是否还有下一页
             paging = data.get('paging', {})
@@ -293,7 +317,7 @@ class ZhihuCrawler:
             else:
                 break
 
-        print(f"  共收集 {root_collected} 条主评论")
+        return new_count
 
     def _crawl_child_comments(self, answer_id: str, parent_comment_id: str, child_count: int):
         """
