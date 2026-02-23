@@ -144,9 +144,25 @@ class ZhihuHTTPClient:
             # 检查限流
             if self._handle_rate_limit(response):
                 if retry_on_rate_limit:
-                    print(f"触发限流，等待后重试: {url}")
-                    time.sleep(self.rate_limiter.adaptive_delay)
-                    return self.get(url, params, retry_on_rate_limit=False)
+                    # 最多重试 3 次，每次等待更长
+                    for attempt in range(1, 4):
+                        wait_time = self.rate_limiter.adaptive_delay * attempt
+                        print(f"触发限流(403/429)，等待 {wait_time:.1f}s 后第{attempt}次重试: {url}")
+                        time.sleep(wait_time)
+                        self.rate_limiter.wait()
+                        try:
+                            response = self.session.get(
+                                url, params=params,
+                                headers=self._get_headers(),
+                                timeout=self.timeout
+                            )
+                            if response.status_code == 200:
+                                self.rate_limiter.reset_delay()
+                                return response.json()
+                        except Exception:
+                            continue
+                    print(f"请求失败(限流，已重试3次): {url}")
+                    return None
                 else:
                     print(f"请求失败(限流): {url}")
                     return None
