@@ -4,6 +4,7 @@
 """
 import os
 import sys
+import csv
 import asyncio
 import argparse
 import yaml
@@ -66,6 +67,139 @@ def show_gaps(db_path: str, min_gap: int, limit: int = 30):
 
     print(f"\n共 {len(gaps)} 条")
     gf.close()
+
+
+def export_tracking(db_path: str, output_path: str = None):
+    """导出楼中楼追溯数据到 CSV"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    # 检查表是否存在
+    table_exists = cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='thread_tracking'"
+    ).fetchone()
+    if not table_exists:
+        print("错误：thread_tracking 表不存在，请先运行爬虫")
+        conn.close()
+        return
+
+    # 查询所有追溯数据，按 answer_id 分组
+    rows = cursor.execute('''
+        SELECT
+            t.answer_id,
+            COALESCE(a.question_id, '') as question_id,
+            t.root_comment_id,
+            t.thread_type,
+            t.expected_replies,
+            t.actual_replies,
+            (t.expected_replies - t.actual_replies) as gap,
+            t.crawled_at
+        FROM thread_tracking t
+        LEFT JOIN answers a ON t.answer_id = a.id
+        ORDER BY t.answer_id, (t.expected_replies - t.actual_replies) DESC
+    ''').fetchall()
+
+    if not rows:
+        print("没有追溯数据")
+        conn.close()
+        return
+
+    # 确定输出路径
+    if not output_path:
+        data_dir = os.path.dirname(db_path)
+        output_path = os.path.join(data_dir, 'thread_tracking.csv')
+
+    # 写入 CSV
+    with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'answer_id', 'question_id', 'root_comment_id',
+            'thread_type', 'expected_replies', 'actual_replies',
+            'gap', 'crawled_at'
+        ])
+
+        total_exp = 0
+        total_act = 0
+        total_gap_threads = 0
+
+        for row in rows:
+            exp = row[4]
+            act = row[5]
+            gap = row[6]
+            total_exp += exp
+            total_act += act
+            if gap > 0:
+                total_gap_threads += 1
+            writer.writerow(row)
+
+    conn.close()
+
+    total_threads = len(rows)
+    print(f"\n已导出 {total_threads} 条追溯记录到: {output_path}")
+    print(f"  总预期: {total_exp}, 总实际: {total_act}, 总缺口: {total_exp - total_act}")
+    print(f"  有缺口的楼层: {total_gap_threads}/{total_threads}")
+
+
+def export_bottom_log(db_path: str, output_path: str = None):
+    """导出滚动触底日志（世界尽头）到 CSV"""
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+
+    table_exists = cursor.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='scroll_bottom_log'"
+    ).fetchone()
+    if not table_exists:
+        print("错误：scroll_bottom_log 表不存在，请先运行爬虫")
+        conn.close()
+        return
+
+    rows = cursor.execute('''
+        SELECT
+            s.answer_id,
+            COALESCE(a.question_id, '') as question_id,
+            a.comment_count as expected_comments,
+            s.total_visible,
+            s.last_comment_id,
+            s.last_author,
+            s.last_content,
+            s.last_time,
+            s.last_likes,
+            CASE WHEN s.last_is_child = 1 THEN '子评论' ELSE '根评论' END as comment_type,
+            s.scroll_rounds,
+            s.crawled_at
+        FROM scroll_bottom_log s
+        LEFT JOIN answers a ON s.answer_id = a.id
+        ORDER BY COALESCE(a.comment_count, 0) DESC
+    ''').fetchall()
+
+    if not rows:
+        print("没有滚动触底日志")
+        conn.close()
+        return
+
+    if not output_path:
+        data_dir = os.path.dirname(db_path)
+        output_path = os.path.join(data_dir, 'scroll_bottom_log.csv')
+
+    with open(output_path, 'w', newline='', encoding='utf-8-sig') as f:
+        writer = csv.writer(f)
+        writer.writerow([
+            'answer_id', 'question_id', 'expected_comments',
+            'total_visible', 'last_comment_id', 'last_author',
+            'last_content', 'last_time', 'last_likes',
+            'comment_type', 'scroll_rounds', 'crawled_at'
+        ])
+        for row in rows:
+            writer.writerow(row)
+
+    conn.close()
+
+    print(f"\n已导出 {len(rows)} 条触底日志到: {output_path}")
+    print(f"\n{'Answer ID':<15} {'预期':>6} {'面板可见':>8} {'最后评论ID':<15} {'作者':<10} {'类型':<6} {'内容预览'}")
+    print('-' * 100)
+    for r in rows:
+        content_preview = (r[6] or '')[:30]
+        print(f"{r[0]:<15} {r[2] or '?':>6} {r[3]:>8} {r[4]:<15} {r[5]:<10} {r[9]:<6} {content_preview}")
 
 
 def show_progress(db_path: str):
@@ -214,12 +348,13 @@ def main():
   python main.py --show-progress                 # 查看断点续爬进度
   python main.py --reset-progress                # 清除进度，强制重新爬
   python main.py --min-gap 50 --headless         # headless 模式
+  python main.py --export-tracking               # 导出楼中楼追溯 CSV
         """
     )
 
     parser.add_argument('--config', '-c',
-                        default='../zhihu_crawler_enhanced/config.yaml',
-                        help='配置文件路径 (默认: ../zhihu_crawler_enhanced/config.yaml)')
+                        default='../zhihu_crawler/config.yaml',
+                        help='配置文件路径 (默认: ../zhihu_crawler/config.yaml)')
     parser.add_argument('--db',
                         default='../zhihu_crawler/data/zhihu.db',
                         help='数据库路径 (默认: ../zhihu_crawler/data/zhihu.db)')
@@ -251,6 +386,14 @@ def main():
                         help='显示浏览器爬取进度')
     parser.add_argument('--reset-progress', action='store_true',
                         help='清除断点续爬进度，强制重新爬取所有回答')
+    parser.add_argument('--export-tracking', action='store_true',
+                        help='导出楼中楼追溯数据到 CSV')
+    parser.add_argument('--tracking-output', type=str, default=None,
+                        help='追溯 CSV 输出路径（默认: data/thread_tracking.csv）')
+    parser.add_argument('--export-bottom', action='store_true',
+                        help='导出滚动触底日志（世界尽头）到 CSV')
+    parser.add_argument('--bottom-output', type=str, default=None,
+                        help='触底日志 CSV 输出路径（默认: data/scroll_bottom_log.csv）')
 
     args = parser.parse_args()
 
@@ -276,6 +419,14 @@ def main():
 
     if args.reset_progress:
         reset_progress(db_path)
+        return
+
+    if args.export_tracking:
+        export_tracking(db_path, args.tracking_output)
+        return
+
+    if args.export_bottom:
+        export_bottom_log(db_path, args.bottom_output)
         return
 
     # 需要加载配置的模式
