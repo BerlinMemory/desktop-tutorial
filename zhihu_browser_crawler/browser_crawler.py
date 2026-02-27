@@ -14,6 +14,7 @@ DOM 结构参考（2026-02 知乎版本）：
 - 子评论: css-1kwt8l8 类
 """
 import asyncio
+import os
 import random
 import sqlite3
 import sys
@@ -21,8 +22,16 @@ import time
 from typing import Dict, List, Optional
 
 # Windows 控制台 UTF-8 兼容
+os.environ.setdefault('PYTHONIOENCODING', 'utf-8')
 try:
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
+    sys.stderr.reconfigure(encoding='utf-8', errors='replace')
+except Exception:
+    pass
+# 尝试设置控制台代码页 (仅 Windows)
+try:
+    if sys.platform == 'win32':
+        os.system('chcp 65001 >nul 2>&1')
 except Exception:
     pass
 
@@ -87,12 +96,16 @@ class BrowserCrawler:
             print("[提示] playwright-stealth 未安装，跳过反检测")
 
         self.playwright = await async_playwright().start()
+        # headless 模式使用 Chromium 新无头参数，更难被反爬检测
+        launch_args = [
+            '--disable-blink-features=AutomationControlled',
+            '--no-sandbox',
+        ]
+        if self.headless:
+            launch_args.append('--headless=new')
         self.browser = await self.playwright.chromium.launch(
             headless=self.headless,
-            args=[
-                '--disable-blink-features=AutomationControlled',
-                '--no-sandbox',
-            ]
+            args=launch_args
         )
 
         self.context = await self.browser.new_context(
@@ -156,6 +169,33 @@ class BrowserCrawler:
                 finished_at TEXT
             )
         ''')
+        # 楼中楼追溯表
+        self.db_conn.execute('''
+            CREATE TABLE IF NOT EXISTS thread_tracking (
+                answer_id        TEXT NOT NULL,
+                root_comment_id  TEXT NOT NULL,
+                thread_type      TEXT NOT NULL,
+                expected_replies INTEGER NOT NULL,
+                actual_replies   INTEGER DEFAULT 0,
+                crawled_at       TEXT,
+                PRIMARY KEY (answer_id, root_comment_id)
+            )
+        ''')
+        # 滚动触底日志表
+        self.db_conn.execute('''
+            CREATE TABLE IF NOT EXISTS scroll_bottom_log (
+                answer_id        TEXT PRIMARY KEY,
+                total_visible    INTEGER,
+                last_comment_id  TEXT,
+                last_author      TEXT,
+                last_content     TEXT,
+                last_time        TEXT,
+                last_likes       INTEGER DEFAULT 0,
+                last_is_child    INTEGER DEFAULT 0,
+                scroll_rounds    INTEGER DEFAULT 0,
+                crawled_at       TEXT
+            )
+        ''')
         # 给 comments 表添加 source 和 inserted_at 列
         for col_sql, col_name in [
             ("ALTER TABLE comments ADD COLUMN source TEXT DEFAULT 'api'", 'source'),
@@ -170,12 +210,12 @@ class BrowserCrawler:
         self.db_conn.commit()
 
     def _is_answer_done(self, answer_id: str) -> bool:
-        """检查该回答是否已完成爬取"""
+        """检查该回答是否已完成爬取（done 或 comments_closed 都跳过）"""
         row = self.db_conn.execute(
             'SELECT status FROM browser_crawl_progress WHERE answer_id = ?',
             (answer_id,)
         ).fetchone()
-        return row is not None and row[0] == 'done'
+        return row is not None and row[0] in ('done', 'comments_closed')
 
     def _mark_answer_started(self, answer_id: str):
         """标记回答开始爬取"""
@@ -207,6 +247,15 @@ class BrowserCrawler:
         ''', (answer_id,))
         self.db_conn.commit()
 
+    def _mark_answer_comments_closed(self, answer_id: str):
+        """标记回答评论区已关闭（不再重试）"""
+        self.db_conn.execute('''
+            UPDATE browser_crawl_progress SET status='comments_closed',
+            finished_at=datetime('now','localtime')
+            WHERE answer_id=?
+        ''', (answer_id,))
+        self.db_conn.commit()
+
     # ================================================================
     # 核心爬取流程
     # ================================================================
@@ -229,6 +278,15 @@ class BrowserCrawler:
                 await self.page.goto(url, wait_until='load', timeout=30000)
             await self.page.wait_for_timeout(3000)
 
+            # 检测评论区是否已关闭
+            comments_closed = await self.page.evaluate(
+                '() => document.body.innerText.includes("评论区已关闭")'
+            )
+            if comments_closed:
+                print("  [跳过] 评论区已关闭")
+                self._mark_answer_comments_closed(answer_id)
+                return 0
+
             # 先滚到回答区域，确保评论按钮可见
             await self.page.evaluate('''() => {
                 const actions = document.querySelector('.ContentItem-actions');
@@ -246,6 +304,14 @@ class BrowserCrawler:
                 await self.page.wait_for_timeout(3000)
 
             if not opened:
+                # 兜底：再检测一次评论区是否关闭
+                comments_closed = await self.page.evaluate(
+                    '() => document.body.innerText.includes("评论区已关闭")'
+                )
+                if comments_closed:
+                    print("  [跳过] 评论区已关闭")
+                    self._mark_answer_comments_closed(answer_id)
+                    return 0
                 print("  [警告] 多次尝试未能打开评论区，跳过")
                 self._mark_answer_failed(answer_id)
                 return 0
@@ -253,6 +319,14 @@ class BrowserCrawler:
             # 等待评论区加载（headless 模式下可能较慢）
             loaded = await self._wait_for_comments_loaded()
             if not loaded:
+                # 评论区加载失败，检测是否是"评论区已关闭"
+                comments_closed = await self.page.evaluate(
+                    '() => document.body.innerText.includes("评论区已关闭")'
+                )
+                if comments_closed:
+                    print("  [跳过] 评论区已关闭")
+                    self._mark_answer_comments_closed(answer_id)
+                    return 0
                 print("  [警告] 评论区加载超时，跳过")
                 self._mark_answer_failed(answer_id)
                 return 0
@@ -440,7 +514,8 @@ class BrowserCrawler:
         # 阶段一：滚动收集根评论 + 发现楼中楼
         # ═══════════════════════════════════════════
         print("  [阶段一] 滚动收集根评论...")
-        discovered_threads = {}  # rootId -> {rootId, replyCount, text}
+        discovered_threads = {}  # rootId -> {rootId, replyCount, text} (查看全部)
+        inline_expanded_threads = {}  # rootId -> {rootId, replyCount} (展开其他)
         stale_rounds = 0
         scroll_round = 0
         prev_root_count = 0
@@ -471,6 +546,39 @@ class BrowserCrawler:
                 if inserted:
                     round_new += 1
             total_new += round_new
+
+            # 点击"展开其他x条回复"按钮（内联展开，不会打开模态框）
+            # 这类按钮出现在回复数较少的楼层，点击后子评论直接在面板内展开
+            # 同时记录每个楼层的 rootId 和预期回复数
+            expand_results = await self.page.evaluate(r'''() => {
+                const btns = [...document.querySelectorAll('button')];
+                const results = [];
+                for (const btn of btns) {
+                    const text = (btn.textContent || '').trim();
+                    const match = text.match(/展开其他\s*(\d+)\s*条回复/);
+                    if (match) {
+                        let el = btn.parentElement;
+                        let rootId = '';
+                        while (el) {
+                            const did = el.getAttribute('data-id');
+                            if (did) { rootId = did; break; }
+                            el = el.parentElement;
+                        }
+                        btn.click();
+                        results.push({
+                            rootId: rootId,
+                            replyCount: parseInt(match[1])
+                        });
+                    }
+                }
+                return results;
+            }''')
+            for ex in expand_results:
+                rid = ex.get('rootId', '')
+                if rid and rid not in inline_expanded_threads:
+                    inline_expanded_threads[rid] = ex
+            if expand_results:
+                await self.page.wait_for_timeout(1000)  # 等待展开完成
 
             # 收集当前可见的楼中楼按钮信息（不点击）
             thread_buttons = await self.page.evaluate(r'''() => {
@@ -507,28 +615,40 @@ class BrowserCrawler:
                     discovered_threads[rid] = t
                     new_thread_count += 1
 
-            # 增量滚动评论面板容器（不跳底部，确保中间的楼中楼按钮能被捕获）
-            await self.page.evaluate(r'''() => {
+            # 增量滚动评论面板容器，并返回滚动位置信息
+            scroll_info = await self.page.evaluate(r'''() => {
+                let target = null;
                 const container = document.querySelector('.css-34podr');
                 if (container) {
-                    container.scrollTop += 600;
-                    return;
-                }
-                const comment = document.querySelector('.CommentContent');
-                if (comment) {
-                    let el = comment.parentElement;
-                    while (el && el !== document.body) {
-                        const style = window.getComputedStyle(el);
-                        if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
-                            if (el.scrollHeight > el.clientHeight) {
-                                el.scrollTop += 600;
-                                return;
+                    target = container;
+                } else {
+                    const comment = document.querySelector('.CommentContent');
+                    if (comment) {
+                        let el = comment.parentElement;
+                        while (el && el !== document.body) {
+                            const style = window.getComputedStyle(el);
+                            if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
+                                if (el.scrollHeight > el.clientHeight) {
+                                    target = el;
+                                    break;
+                                }
                             }
+                            el = el.parentElement;
                         }
-                        el = el.parentElement;
                     }
                 }
+                if (target) {
+                    target.scrollTop += 600;
+                    return {
+                        found: true,
+                        scrollTop: target.scrollTop,
+                        scrollHeight: target.scrollHeight,
+                        clientHeight: target.clientHeight,
+                        atBottom: target.scrollTop + target.clientHeight >= target.scrollHeight - 50
+                    };
+                }
                 window.scrollBy(0, 600);
+                return { found: false, atBottom: false, scrollTop: 0, scrollHeight: 0, clientHeight: 0 };
             }''')
             await self.page.wait_for_timeout(int(self.scroll_wait * 1000))
 
@@ -537,26 +657,149 @@ class BrowserCrawler:
                 '() => document.querySelectorAll("[data-id]").length'
             )
 
-            # stale 检测
+            # stale 检测（区分「物理到底」和「加载中」）
             cur_saved_count = len(saved_ids)
             has_progress = (new_root_count > prev_root_count
                            or cur_saved_count > prev_saved_count
                            or new_thread_count > 0)
+            at_bottom = scroll_info.get('atBottom', False) if scroll_info else False
+
             if has_progress:
                 stale_rounds = 0
-            else:
+            elif at_bottom:
+                # 物理已到底且没新内容，直接计为 stale
                 stale_rounds += 1
+            else:
+                # 还没到底但没新内容 → 可能是懒加载延迟，多等一会儿
+                await self.page.wait_for_timeout(3000)
+                # 再检查一次是否有新内容加载出来
+                retry_count = await self.page.evaluate(
+                    '() => document.querySelectorAll("[data-id]").length'
+                )
+                if retry_count > new_root_count:
+                    # 等待后有新内容了，不算 stale
+                    stale_rounds = 0
+                    new_root_count = retry_count
+                else:
+                    stale_rounds += 1
+                    # 不在底部时容忍度更高（30轮 vs 默认10轮）
+                    if stale_rounds < 30:
+                        continue
             prev_root_count = new_root_count
             prev_saved_count = cur_saved_count
 
             if scroll_round % 5 == 0 or new_thread_count > 0:
+                pct = ''
+                if scroll_info and scroll_info.get('scrollHeight', 0) > 0:
+                    pct = f" ({int(scroll_info['scrollTop'] / scroll_info['scrollHeight'] * 100)}%)"
                 print(f"    [第{scroll_round}轮] 根评论 {new_root_count}, "
                       f"已保存 {len(saved_ids)}, 新增 {total_new}, "
-                      f"发现楼中楼 {len(discovered_threads)}")
+                      f"发现楼中楼 {len(discovered_threads)}, "
+                      f"内联展开 {len(inline_expanded_threads)}"
+                      f"{pct}")
 
         print(f"  [阶段一完成] {scroll_round}轮, "
-              f"保存 {len(saved_ids)} 条根评论, 新增 {total_new}, "
-              f"发现 {len(discovered_threads)} 个楼中楼")
+              f"保存 {len(saved_ids)} 条评论, 新增 {total_new}, "
+              f"发现 {len(discovered_threads)} 个楼中楼(模态框), "
+              f"{len(inline_expanded_threads)} 个内联展开")
+
+        # 输出面板最底部的评论信息（"世界尽头"）
+        try:
+            last_comment = await self.page.evaluate(r'''() => {
+                const contents = document.querySelectorAll('.CommentContent');
+                if (contents.length === 0) return null;
+                const lastEl = contents[contents.length - 1];
+                const wrapper = lastEl.parentElement;
+                if (!wrapper) return null;
+
+                const strip = t => (t||'').replace(/[\u200b\u200c\u200d\ufeff\u00a0]/g, '').trim();
+
+                // ID
+                let commentId = '';
+                let el = lastEl.parentElement;
+                while (el) {
+                    const did = el.getAttribute('data-id');
+                    if (did) { commentId = did; break; }
+                    el = el.parentElement;
+                }
+
+                // 内容
+                const content = strip(lastEl.textContent).replace(/\n+/g, ' ').slice(0, 80);
+
+                // 作者
+                const authorLink = wrapper.querySelector('a[href*="/people/"]');
+                const authorName = authorLink ? strip(authorLink.textContent) : '匿名用户';
+
+                // 时间
+                let createdTime = '';
+                const spans = wrapper.querySelectorAll('span');
+                for (const span of spans) {
+                    const t = strip(span.textContent);
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(t) || /前$/.test(t) || t === '昨天' || t === '今天') {
+                        createdTime = t; break;
+                    }
+                }
+
+                // 点赞
+                let likeCount = 0;
+                const buttons = wrapper.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const svg = btn.querySelector('svg');
+                    if (svg && svg.className && svg.className.baseVal &&
+                        svg.className.baseVal.includes('Heart')) {
+                        const num = parseInt(strip(btn.textContent));
+                        if (!isNaN(num)) likeCount = num;
+                        break;
+                    }
+                }
+
+                // 是否子评论
+                let isChild = false;
+                let p = lastEl.parentElement;
+                while (p) {
+                    const cls = (p.className || '').toString();
+                    if (cls.includes('css-1kwt8l8')) { isChild = true; break; }
+                    if (cls.includes('css-jp43l4')) break;
+                    p = p.parentElement;
+                }
+
+                // 位置
+                const idx = contents.length;
+                return { id: commentId, content, author: authorName, time: createdTime,
+                         likes: likeCount, isChild, position: idx, total: contents.length };
+            }''')
+            if last_comment:
+                child_tag = '子评论' if last_comment.get('isChild') else '根评论'
+                print(f"  [世界尽头] 面板最后一条评论 (第{last_comment['position']}/{last_comment['total']}条):")
+                print(f"    ID:   {last_comment['id']}")
+                print(f"    作者: {last_comment['author']}  时间: {last_comment['time']}  赞: {last_comment['likes']}  类型: {child_tag}")
+                print(f"    内容: {last_comment['content']}...")
+                # 保存到数据库
+                try:
+                    from datetime import datetime
+                    self.db_conn.execute('''
+                        INSERT OR REPLACE INTO scroll_bottom_log
+                        (answer_id, total_visible, last_comment_id, last_author,
+                         last_content, last_time, last_likes, last_is_child,
+                         scroll_rounds, crawled_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        answer_id,
+                        last_comment['total'],
+                        last_comment['id'],
+                        last_comment['author'],
+                        last_comment['content'],
+                        last_comment['time'],
+                        last_comment['likes'],
+                        1 if last_comment.get('isChild') else 0,
+                        scroll_round,
+                        datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+                    ))
+                    self.db_conn.commit()
+                except Exception as db_err:
+                    print(f"    [警告] 保存世界尽头到DB失败: {db_err}")
+        except Exception as e:
+            print(f"  [世界尽头] 无法获取最后评论: {e}")
 
         # ═══════════════════════════════════════════
         # 阶段二：逐个处理楼中楼
@@ -600,14 +843,29 @@ class BrowserCrawler:
                 if opened:
                     break
 
-                # 没找到，继续滚动面板
+                # 没找到，继续滚动面板（坑 #1/#5: 加 overflow-y fallback）
                 await self.page.evaluate(r'''() => {
                     const container = document.querySelector('.css-34podr');
                     if (container) {
                         container.scrollTop += 800;
-                    } else {
-                        window.scrollBy(0, 800);
+                        return;
                     }
+                    // Fallback: 从 CommentContent 向上找 overflow-y 容器
+                    const comment = document.querySelector('.CommentContent');
+                    if (comment) {
+                        let el = comment.parentElement;
+                        while (el && el !== document.body) {
+                            const style = window.getComputedStyle(el);
+                            if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
+                                if (el.scrollHeight > el.clientHeight) {
+                                    el.scrollTop += 800;
+                                    return;
+                                }
+                            }
+                            el = el.parentElement;
+                        }
+                    }
+                    window.scrollBy(0, 800);
                 }''')
                 await self.page.wait_for_timeout(800)
 
@@ -623,27 +881,75 @@ class BrowserCrawler:
             )
             if not has_modal:
                 await self.page.wait_for_timeout(1500)
+                has_modal = await self.page.evaluate(
+                    '() => !!document.querySelector(".css-1svde17")'
+                )
+
+            # 诊断：确认模态框状态
+            modal_diag = await self.page.evaluate(r'''() => {
+                const modal = document.querySelector('.css-1svde17');
+                if (modal) {
+                    const comments = modal.querySelectorAll('.CommentContent').length;
+                    return {found: true, selector: '.css-1svde17', comments: comments};
+                }
+                // Fallback: 检查所有带 overflow-y 的大容器是否包含评论
+                const all = document.querySelectorAll('*');
+                for (const el of all) {
+                    const cs = window.getComputedStyle(el);
+                    if ((cs.overflowY === 'scroll' || cs.overflowY === 'auto') &&
+                        el.scrollHeight > el.clientHeight + 100) {
+                        const cc = el.querySelectorAll('.CommentContent').length;
+                        if (cc > 0 && el.offsetHeight > 200) {
+                            // 检查是否是新出现的容器（非原评论面板）
+                            const cls = el.className.toString();
+                            return {found: false, fallback: true, class: cls.substring(0, 80),
+                                    comments: cc, scrollH: el.scrollHeight, clientH: el.clientHeight};
+                        }
+                    }
+                }
+                return {found: false, fallback: false, totalComments: document.querySelectorAll('.CommentContent').length};
+            }''')
+            if not modal_diag.get('found'):
+                print(f"      [诊断] 模态框未检测到: {modal_diag}")
 
             # 在模态框内滚动提取子评论
             modal_new = 0
             modal_stale = 0
             prev_modal_count = 0
-            for modal_round in range(100):
-                # 滚动模态框到底部
-                await self.page.evaluate(r'''() => {
+            for modal_round in range(200):
+                # 坑 #6: 增量滚动模态框（用 getComputedStyle 找真正的可滚动容器）
+                scroll_info = await self.page.evaluate(r'''() => {
+                    // 优先在 .css-1svde17 模态框内找可滚动子元素
                     const modal = document.querySelector('.css-1svde17');
-                    if (modal) {
-                        const scrollable = modal.querySelector('[style*="overflow"]')
-                                         || modal;
-                        scrollable.scrollTop = scrollable.scrollHeight;
+                    const searchRoot = modal || document;
+                    
+                    // 用 getComputedStyle 找真正的 overflow-y 滚动容器
+                    const allEls = searchRoot.querySelectorAll('*');
+                    for (const el of allEls) {
+                        const cs = window.getComputedStyle(el);
+                        if ((cs.overflowY === 'scroll' || cs.overflowY === 'auto') &&
+                            el.scrollHeight > el.clientHeight + 50) {
+                            const cc = el.querySelectorAll('.CommentContent').length;
+                            if (cc > 0) {
+                                const before = el.scrollTop;
+                                el.scrollTop += 600;
+                                return {scrolled: true, before: before, after: el.scrollTop,
+                                        scrollH: el.scrollHeight, clientH: el.clientHeight, comments: cc};
+                            }
+                        }
                     }
-                    const comments = document.querySelectorAll('.CommentContent');
-                    if (comments.length > 0) {
-                        comments[comments.length - 1].scrollIntoView({
-                            behavior: 'smooth', block: 'end'
-                        });
+                    
+                    // 如果找不到内部可滚动容器，尝试滚动 modal 自身
+                    if (modal && modal.scrollHeight > modal.clientHeight) {
+                        const before = modal.scrollTop;
+                        modal.scrollTop += 600;
+                        return {scrolled: true, self: true, before: before, after: modal.scrollTop};
                     }
+                    
+                    return {scrolled: false};
                 }''')
+                if modal_round == 0:
+                    print(f"      [滚动诊断] {scroll_info}")
                 await self.page.wait_for_timeout(1500)
 
                 # 点击模态框内的"展开其他 X 条回复"
@@ -659,18 +965,21 @@ class BrowserCrawler:
                     }
                 }''')
 
-                # 提取并保存评论
-                modal_comments = await self._extract_all_comments()
+                # 提取模态框内的评论（限定在模态框 DOM 内）
+                modal_comments = await self._extract_modal_comments()
                 for c in modal_comments:
                     cid = c['id']
+                    if cid == root_id:  # 跳过根评论本身（模态框内会显示）
+                        continue
                     if cid in saved_ids:
                         continue
                     saved_ids.add(cid)
+                    # 坑 #8: 模态框内一律视为子评论，parent_id = 当前楼中楼根ID
                     inserted = self._insert_comment(
                         comment_id=cid,
                         answer_id=answer_id,
-                        parent_id=c.get('parent_id'),
-                        is_child=1 if c.get('is_child') else 0,
+                        parent_id=root_id,
+                        is_child=1,
                         author_name=c.get('author_name', '匿名用户'),
                         content=c.get('content', ''),
                         like_count=c.get('like_count', 0),
@@ -680,12 +989,15 @@ class BrowserCrawler:
                     if inserted:
                         modal_new += 1
 
-                cur_count = await self.page.evaluate(
-                    '() => document.querySelectorAll(".CommentContent").length'
-                )
+                # 只计算模态框内的评论数（避免被面板评论数干扰）
+                cur_count = await self.page.evaluate(r'''() => {
+                    const modal = document.querySelector('.css-1svde17');
+                    if (modal) return modal.querySelectorAll('.CommentContent').length;
+                    return document.querySelectorAll('.CommentContent').length;
+                }''')
                 if cur_count == prev_modal_count:
                     modal_stale += 1
-                    if modal_stale >= 3:
+                    if modal_stale >= 5:
                         break
                 else:
                     modal_stale = 0
@@ -699,7 +1011,7 @@ class BrowserCrawler:
             await self.page.keyboard.press('Escape')
             await self.page.wait_for_timeout(1500)
 
-            # 验证模态框已关闭
+            # 坑 #4: 验证模态框已关闭（排除 signFlowModal）
             still_modal = await self.page.evaluate(r'''() => {
                 const closeBtn = document.querySelector('button[aria-label="关闭"]');
                 if (!closeBtn) return false;
@@ -711,6 +1023,30 @@ class BrowserCrawler:
                 await self.page.keyboard.press('Escape')
                 await self.page.wait_for_timeout(1000)
 
+            # 坑 #3: 验证全评论面板是否存活（Escape 可能连锁关闭面板）
+            panel_exists = await self.page.evaluate(
+                '() => !!document.querySelector(".css-34podr")'
+            )
+            if not panel_exists:
+                # Fallback: 检查 overflow-y 容器
+                panel_exists = await self.page.evaluate(r'''() => {
+                    const comment = document.querySelector('.CommentContent');
+                    if (!comment) return false;
+                    let el = comment.parentElement;
+                    while (el && el !== document.body) {
+                        const style = window.getComputedStyle(el);
+                        if (style.overflowY === 'scroll' || style.overflowY === 'auto') {
+                            if (el.scrollHeight > el.clientHeight) return true;
+                        }
+                        el = el.parentElement;
+                    }
+                    return false;
+                }''')
+            if not panel_exists:
+                print("      [恢复] 面板被连带关闭，重新打开...")
+                await self._enter_full_comment_page()
+                await self.page.wait_for_timeout(2000)
+
             # 每处理 10 个楼中楼打印进度
             if processed_count % 10 == 0:
                 print(f"    [进度] 已处理 {processed_count}/{len(discovered_threads)}, "
@@ -718,7 +1054,139 @@ class BrowserCrawler:
 
         print(f"  [阶段二完成] 处理了 {processed_count} 个楼中楼, "
               f"共保存 {len(saved_ids)} 条, 新增 {total_new}")
+
+        # ═══════════════════════════════════════════
+        # 楼中楼追溯汇总
+        # ═══════════════════════════════════════════
+        all_threads = {}
+        for rid, info in discovered_threads.items():
+            all_threads[rid] = {'type': '模态框', 'expected': info['replyCount']}
+        for rid, info in inline_expanded_threads.items():
+            all_threads[rid] = {'type': '内联展开', 'expected': info['replyCount']}
+
+        if all_threads and self.db_conn:
+            from datetime import datetime
+            now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            cursor = self.db_conn.cursor()
+            print(f"\n  [楼中楼追溯] 共 {len(all_threads)} 个楼层")
+            print(f"    {'类型':<8} {'rootId':<15} {'预期':>6} {'实际':>6} {'差距':>6}")
+            print(f"    {'-'*45}")
+            total_exp = 0
+            total_act = 0
+            for rid, tinfo in sorted(all_threads.items(),
+                                      key=lambda x: -x[1]['expected']):
+                exp = tinfo['expected']
+                act = cursor.execute(
+                    "SELECT COUNT(*) FROM comments WHERE parent_id=? AND answer_id=?",
+                    (rid, answer_id)
+                ).fetchone()[0]
+                gap = exp - act
+                total_exp += exp
+                total_act += act
+                flag = " ⚠" if gap > 0 else " ✓"
+                print(f"    {tinfo['type']:<8} {rid:<15} {exp:>6} {act:>6} {gap:>+6}{flag}")
+                # 写入 DB
+                cursor.execute('''
+                    INSERT OR REPLACE INTO thread_tracking
+                    (answer_id, root_comment_id, thread_type,
+                     expected_replies, actual_replies, crawled_at)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (answer_id, rid, tinfo['type'], exp, act, now))
+            self.db_conn.commit()
+            print(f"    {'-'*45}")
+            print(f"    {'合计':<8} {'':<15} {total_exp:>6} {total_act:>6} "
+                  f"{total_exp - total_act:>+6}")
+
         return total_new
+
+    async def _extract_modal_comments(self) -> list:
+        """
+        从模态框 (.css-1svde17) 内提取评论数据
+        与 _extract_all_comments 逻辑相同，但限定 DOM 范围在模态框内
+        避免面板评论干扰模态框的 stale 检测
+        """
+        comments = await self.page.evaluate(r'''() => {
+            const strip = t => (t||'').replace(/[\u200b\u200c\u200d\ufeff\u00a0]/g, '').trim();
+            const results = [];
+            // 限定在模态框内
+            const modal = document.querySelector('.css-1svde17');
+            const root = modal || document;
+            const contentEls = root.querySelectorAll('.CommentContent');
+
+            contentEls.forEach((contentEl, index) => {
+                const wrapper = contentEl.parentElement;
+                if (!wrapper) return;
+
+                const content = strip(contentEl.textContent).replace(/\n+/g, ' ');
+
+                const authorLink = wrapper.querySelector('a[href*="/people/"]');
+                const authorName = authorLink ? strip(authorLink.textContent) : '匿名用户';
+                const authorUrl = authorLink ? authorLink.href : '';
+                let authorId = '';
+                if (authorUrl) {
+                    const parts = authorUrl.split('/people/');
+                    if (parts.length > 1) authorId = parts[1].split('/')[0].split('?')[0];
+                }
+
+                let createdTime = '';
+                const spans = wrapper.querySelectorAll('span');
+                for (const span of spans) {
+                    const t = strip(span.textContent);
+                    if (/^\d{4}-\d{2}-\d{2}$/.test(t)) { createdTime = t; break; }
+                    if (/前$/.test(t) || t === '昨天' || t === '今天' || t === '刚刚') {
+                        createdTime = t; break;
+                    }
+                }
+
+                let likeCount = 0;
+                const buttons = wrapper.querySelectorAll('button');
+                for (const btn of buttons) {
+                    const svg = btn.querySelector('svg');
+                    if (svg && svg.className && svg.className.baseVal &&
+                        svg.className.baseVal.includes('Heart')) {
+                        const likeText = strip(btn.textContent);
+                        const num = parseInt(likeText);
+                        if (!isNaN(num)) likeCount = num;
+                        break;
+                    }
+                }
+
+                // 生成评论 ID
+                let commentId = '';
+                let parentId = null;
+                let el = contentEl.parentElement;
+                let foundSelf = false;
+                while (el) {
+                    const did = el.getAttribute('data-id');
+                    if (did) {
+                        if (!foundSelf) {
+                            commentId = did;
+                            foundSelf = true;
+                        } else {
+                            parentId = did;
+                            break;
+                        }
+                    }
+                    el = el.parentElement;
+                }
+                if (!commentId) commentId = 'm_' + index;
+
+                results.push({
+                    id: commentId,
+                    author_name: authorName,
+                    author_id: authorId,
+                    content: content,
+                    created_time: createdTime,
+                    like_count: likeCount,
+                    is_child: true,
+                    parent_id: parentId,
+                    reply_to: null,
+                });
+            });
+
+            return results;
+        }''')
+        return comments or []
 
     async def _extract_all_comments(self) -> list:
         """
